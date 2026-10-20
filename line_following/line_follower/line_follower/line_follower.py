@@ -1,250 +1,277 @@
-import threading
-from dataclasses import dataclass, replace
-
 import rclpy
 from rclpy.node import Node
-from rclpy.callback_groups import ReentrantCallbackGroup
-from rclpy.executors import MultiThreadedExecutor
 
-from rcl_interfaces.msg import FloatingPointRange, ParameterDescriptor, SetParametersResult
+from rcl_interfaces.msg import (
+    FloatingPointRange, Parameter as ParameterMsg, ParameterDescriptor,
+    ParameterType, ParameterValue, SetParametersResult)
+from rcl_interfaces.srv import GetParameters, SetParameters
 from geometry_msgs.msg import Twist
 from sensor_msgs.msg import Range
 
 
-# ROS topics
-LEFT_TOPIC = '/ground/left'
-RIGHT_TOPIC = '/ground/right'
-CMD_VEL_TOPIC = '/cmd_vel'
+# Thymio driver node and the parameter that defines the ground threshold
+DRIVER_NODE = '/thymio_driver'
+DRIVER_THRESHOLD_PARAM = 'ground.threshold'
+DRIVER_TIMEOUT = 2.0               # Seconds to wait for the driver when starting
+
+# Used only if the driver is not running when this node starts
+FALLBACK_THRESHOLD = 200.0
 
 
-
-# DYNAMIC PARAMETERS
-
-@dataclass
-class ControlParams:
-    forward_speed: float = 0.10        # Straight-line speed (m/s)
-    turn_linear_speed: float = 0.06    # Linear speed while turning (m/s)
-    turn_angular_speed: float = 0.8    #Angular speed while turning (rad/s)
-    search_delay: float = 0.5          # Time moving straight before starting the search (s)
-    search_speed: float = 0.8          # Rotation speed during the search (rad/s)
-    line_min: float = 0.5              # Lowest reading value for line (0.0 to 1.0)
-    line_max: float = 1.0              # Highest reading value for line (0.0 to 1.0)
-
-
-# Parameter metadata for validation and limits in ROS 2
-PARAM_INFO = {
-    'forward_speed':      ('Linear speed on straights (m/s)', 0.0, 0.5),
-    'turn_linear_speed':  ('Linear speed on curves (m/s)', 0.0, 0.5),
-    'turn_angular_speed': ('Angular speed on curves (rad/s)', 0.0, 3.0),
-    'search_delay':       ('Time without line until search starts (s)', 0.0, 10.0),
-    'search_speed':       ('Angular speed during search (rad/s)', 0.0, 3.0),
-    'line_min':           ('Minimum threshold for line detection', 0.0, 1.0),
-    'line_max':           ('Maximum threshold for line detection', 0.0, 1.0),
-}
-
-
-
-# SENSORS AND MUTEX
-class GroundSensor:
-
-    def __init__(self, name: str):
-        self.name = name
-        self._lock = threading.Lock()
-        self._value = 0.0
-
-    def update(self, msg: Range) -> None:
-        """Sensor write callback with Mutex."""
-        with self._lock:
-            self._value = msg.range
-
-    def read(self) -> float:
-        """Read protected with Mutex."""
-        with self._lock:
-            return self._value
-
-#Manages the collection of the robot's sensors
-class SensorDatabase:
-    def __init__(self):
-        self._sensors = {}
-
-    def add(self, sensor: GroundSensor) -> GroundSensor:
-        self._sensors[sensor.name] = sensor
-        return sensor
-
-    def snapshot(self) -> dict:
-        #Captures the instantaneous state of all registered sensors
-        return {name: sensor.read() for name, sensor in self._sensors.items()}
-
-
-
-# MAIN NODE
 class LineFollower(Node):
 
     def __init__(self):
         super().__init__('line_follower')
 
-        #Callback Group -> parallel callbacks
-        self.cb_group = ReentrantCallbackGroup()
+        # ------------------------------------------------------------------
+        # PARAMETER: ground_threshold
+        # (declared first, before the control timer exists, so the robot
+        #  does not move while the node waits for the driver to answer)
+        # ------------------------------------------------------------------
 
-        #Parameter Management
-        self._declare_parameters()
-        self._params_lock = threading.Lock()
-        self._params = ControlParams(**{
-            name: self.get_parameter(name).value for name in PARAM_INFO
-        })
-        self.add_on_set_parameters_callback(self._on_parameters_change)
+        # Clients used to read and change parameters of the Thymio driver node
+        self.driver_get_client = self.create_client(
+            GetParameters, f'{DRIVER_NODE}/get_parameters')
+        self.driver_set_client = self.create_client(
+            SetParameters, f'{DRIVER_NODE}/set_parameters')
 
-        #Sensor Database Initialization
-        self.sensor_db = SensorDatabase()
-        left = self.sensor_db.add(GroundSensor('left'))
-        right = self.sensor_db.add(GroundSensor('right'))
+        # Type used by the driver parameter (integer or double)
+        self.driver_threshold_is_double = False
 
-        self.create_subscription(
-            Range, LEFT_TOPIC, left.update, 10, callback_group=self.cb_group
-        )
-        self.create_subscription(
-            Range, RIGHT_TOPIC, right.update, 10, callback_group=self.cb_group
-        )
-
-        #Velocity Command publisher
-        self.cmd_vel_pub = self.create_publisher(Twist, CMD_VEL_TOPIC, 10)
-
-        #Control Loop Internal State
-        self.last_direction = 0     # 1 = left | -1 = right | 0 = unknown
-        self.line_lost_time = None  # Marks the moment the line was lost
-
-        #Control Timer (10 Hz)
-        self.create_timer(0.1, self.control_loop, callback_group=self.cb_group)
-        self.get_logger().info('LineFollower node (Parameterized with Mutex) started.')
-
-    # PARAMETER METHODS
-    #Declares parameters with description and limits in ROS 2
-    def _declare_parameters(self):
-        defaults = ControlParams()
-        for name, (description, low, high) in PARAM_INFO.items():
-            self.declare_parameter(
-                name,
-                getattr(defaults, name),
-                ParameterDescriptor(
-                    description=description,
-                    floating_point_range=[FloatingPointRange(from_value=low, to_value=high, step=0.0)]
-                )
+        # Starts with the value the driver is using right now, so starting
+        # this node never changes the driver by itself
+        self.declare_parameter(
+            'ground_threshold',
+            self.read_driver_threshold(),
+            ParameterDescriptor(
+                description='Ground threshold of thymio_driver (forwarded to ground.threshold)',
+                # Thymio raw ground values go from 0 to 1023
+                floating_point_range=[FloatingPointRange(from_value=0.0, to_value=1023.0, step=0.0)]
             )
+        )
 
-    def _on_parameters_change(self, changes) -> SetParametersResult:
-        new_values = {c.name: float(c.value) for c in changes if c.name in PARAM_INFO}
+        # Called every time someone runs: ros2 param set /line_follower ground_threshold ...
+        self.add_on_set_parameters_callback(self.parameters_callback)
 
-        with self._params_lock:
-            candidate = replace(self._params, **new_values)
+        # Publishes to the robot velocity topic
+        self.cmd_vel_pub = self.create_publisher(Twist, '/cmd_vel', 10)
 
-        # Extra integrity validation between parameters
-        if candidate.line_min > candidate.line_max:
-            reason = 'line_min cannot be greater than line_max'
-            self.get_logger().warn(f'Parameter rejected: {reason}')
-            return SetParametersResult(successful=False, reason=reason)
+        # Last values received from the sensors
+        self.left_sensor = 0.0
+        self.right_sensor = 0.0
 
-        with self._params_lock:
-            self._params = candidate
-            
-        for name, val in new_values.items():
-            self.get_logger().info(f'Parameter changed: {name} = {val}')
+        # Stores the last direction in which the line was detected
+        # 1  = left
+        # -1 = right
+        # 0  = unknown
+        self.last_direction = 0
+
+        # Stores how long both sensors have been off the line
+        self.line_lost_time = None
+
+        # Maximum time without detecting the line before starting the search
+        self.search_delay = 0.5
+
+        # Rotation speed during the search
+        self.search_speed = 0.8
+
+        # Subscription to the left ground sensor
+        self.left_sub = self.create_subscription(Range, '/ground/left', self.left_callback, 10)
+
+        # Subscription to the right ground sensor
+        self.right_sub = self.create_subscription(Range, '/ground/right', self.right_callback, 10)
+
+        # Timer running the control loop 10 times per second (10 Hz)
+        self.timer = self.create_timer(0.1, self.control_loop)
+
+    # ----------------------------------------------------------------------
+    # GROUND THRESHOLD PARAMETER
+    # ----------------------------------------------------------------------
+    def read_driver_threshold(self):
+        """Reads ground.threshold from thymio_driver (falls back if the driver is off)."""
+
+        if not self.driver_get_client.wait_for_service(timeout_sec=DRIVER_TIMEOUT):
+            self.get_logger().warn(
+                f'{DRIVER_NODE} not found. ground_threshold starts at {FALLBACK_THRESHOLD} '
+                'and is only sent to the driver when you change it.')
+            return FALLBACK_THRESHOLD
+
+        request = GetParameters.Request()
+        request.names = [DRIVER_THRESHOLD_PARAM]
+        future = self.driver_get_client.call_async(request)
+        rclpy.spin_until_future_complete(self, future, timeout_sec=DRIVER_TIMEOUT)
+
+        if not future.done() or not future.result().values:
+            self.get_logger().warn('Could not read ground.threshold from the driver.')
+            return FALLBACK_THRESHOLD
+
+        value = future.result().values[0]
+
+        # The driver may store the threshold as double or as integer
+        if value.type == ParameterType.PARAMETER_DOUBLE:
+            self.driver_threshold_is_double = True
+            return float(value.double_value)
+
+        if value.type == ParameterType.PARAMETER_INTEGER:
+            self.driver_threshold_is_double = False
+            return float(value.integer_value)
+
+        self.get_logger().warn(f'{DRIVER_THRESHOLD_PARAM} is not set in the driver.')
+        return FALLBACK_THRESHOLD
+
+    def parameters_callback(self, changes):
+        """Called by ROS BEFORE a parameter changes. Returning False rejects the change."""
+
+        for change in changes:
+            if change.name == 'ground_threshold':
+
+                # Rejects the change if the driver is not running
+                if not self.driver_set_client.service_is_ready():
+                    reason = f'{DRIVER_NODE} is not available'
+                    self.get_logger().warn(f'Parameter rejected: {reason}')
+                    return SetParametersResult(successful=False, reason=reason)
+
+                self.send_threshold_to_driver(change.value)
 
         return SetParametersResult(successful=True)
 
-    def _get_params(self) -> ControlParams:
-        with self._params_lock:
-            return self._params
+    def send_threshold_to_driver(self, threshold):
+        """Sends the new threshold to thymio_driver (does not block the node)."""
 
-    # CONTROL AND DECISION METHODS
+        # Builds the value using the same type the driver uses
+        value = ParameterValue()
+        if self.driver_threshold_is_double:
+            value.type = ParameterType.PARAMETER_DOUBLE
+            value.double_value = float(threshold)
+        else:
+            value.type = ParameterType.PARAMETER_INTEGER
+            value.integer_value = int(round(threshold))
+
+        request = SetParameters.Request()
+        request.parameters = [ParameterMsg(name=DRIVER_THRESHOLD_PARAM, value=value)]
+
+        # Sends the request; driver_answer_callback runs when the driver answers
+        future = self.driver_set_client.call_async(request)
+        future.add_done_callback(self.driver_answer_callback)
+
+    def driver_answer_callback(self, future):
+        """Shows in the terminal whether the driver accepted the new threshold."""
+
+        result = future.result().results[0]
+
+        if result.successful:
+            self.get_logger().info(f'Driver {DRIVER_THRESHOLD_PARAM} updated.')
+        else:
+            self.get_logger().warn(f'Driver refused the threshold: {result.reason}')
+
+    # ----------------------------------------------------------------------
+    # SENSORS AND CONTROL
+    # ----------------------------------------------------------------------
+    def left_callback(self, msg):
+        self.left_sensor = msg.range
+
+    def right_callback(self, msg):
+        self.right_sensor = msg.range
+
     def control_loop(self):
-        params = self._get_params()
-        readings = self.sensor_db.snapshot()
-        
-        left_val = readings['left']
-        right_val = readings['right']
-
-        # Checks whether the reading is within the range configured for the line
-        left_on = self.is_on_line(left_val, params)
-        right_on = self.is_on_line(right_val, params)
-
         cmd = Twist()
 
-        #Case 1: Only the left sensor is over the line
-        if left_on and not right_on:
+        left = self.left_sensor
+        right = self.right_sensor
+
+
+        #Case 1. LEFT SENSOR OVER THE LINE
+        if left == 1.0 and right == 0.0:
+
+            # The line is on the left
             self.last_direction = 1
-            self.line_lost_time = None
-            cmd.linear.x = params.turn_linear_speed
-            cmd.angular.z = params.turn_angular_speed
 
-        #Case 2: Only the right sensor is over the line
-        elif right_on and not left_on:
+            # The line was detected, so reset the timer
+            self.line_lost_time = None
+
+            cmd.linear.x = 0.06
+            cmd.angular.z = 0.8
+
+        #Case 2. RIGHT SENSOR OVER THE LINE
+        elif left == 0.0 and right == 1.0:
+
+            # The line is on the right
             self.last_direction = -1
-            self.line_lost_time = None
-            cmd.linear.x = params.turn_linear_speed
-            cmd.angular.z = -params.turn_angular_speed
 
-        #Case 3: Both sensors are over the line
-        elif left_on and right_on:
+            # The line was detected, so reset the timer
             self.line_lost_time = None
-            cmd.linear.x = params.forward_speed
+
+            cmd.linear.x = 0.06
+            cmd.angular.z = -0.8
+
+        #Case 3. BOTH SENSORS OVER THE LINE
+        elif left == 1.0 and right == 1.0:
+
+            # The line was detected again
+            self.line_lost_time = None
+
+            cmd.linear.x = 0.10
             cmd.angular.z = 0.0
 
-        #Case 4: No sensor is over the line
-        elif not left_on and not right_on:
-            now = self.get_clock().now()
+        #Case 4. NO SENSOR OVER THE LINE
+        elif left == 0.0 and right == 0.0:
 
+            # First moment when the line is lost
             if self.line_lost_time is None:
-                self.line_lost_time = now
+                self.line_lost_time = self.get_clock().now()
 
-            elapsed_time = (now - self.line_lost_time).nanoseconds / 1e9
+            # Calculate how long we have been without detecting the line
+            elapsed_time = (self.get_clock().now() - self.line_lost_time).nanoseconds / 1e9
 
-            #Case 4.1: Time limit not reached yet -> keeps moving forward
-            if elapsed_time < params.search_delay:
-                cmd.linear.x = params.forward_speed
+            #Case 4.1. Not enough time has passed:
+            # continue moving forward
+            if elapsed_time < self.search_delay:
+
+                cmd.linear.x = 0.10
                 cmd.angular.z = 0.0
 
-            #Case 4.2: Time limit exceeded -> performs the search
+            #Case 4.2. Enough time has passed:
+            # start searching for the line
             else:
+
+                # IF the last time we saw the line was on the left
                 if self.last_direction == 1:
-                    cmd.linear.x = 0.0
-                    cmd.angular.z = params.search_speed
 
+                    cmd.linear.x = 0.0
+                    cmd.angular.z = self.search_speed
+
+                # IF the last time we saw the line was on the right
                 elif self.last_direction == -1:
-                    cmd.linear.x = 0.0
-                    cmd.angular.z = -params.search_speed
 
+                    cmd.linear.x = 0.0
+                    cmd.angular.z = -self.search_speed
+
+                # IF we do not have a known direction yet
                 else:
+
+                    # remain stopped
                     cmd.linear.x = 0.0
                     cmd.angular.z = 0.0
 
-        #Publishes the message to /cmd_vel
+        #Case 5. UNEXPECTED VALUE
+        else:
+            cmd.linear.x = 0.0
+            cmd.angular.z = 0.0
+
+        # Publishes the command
         self.cmd_vel_pub.publish(cmd)
 
-    @staticmethod
-    def is_on_line(value: float, params: ControlParams) -> bool:
-        return params.line_min <= value <= params.line_max
-
-    def stop_robot(self):
-
-        self.cmd_vel_pub.publish(Twist())
-
-
-#MAIN
 
 def main(args=None):
     rclpy.init(args=args)
+
     node = LineFollower()
 
-    # Multithreaded Executor to manage the parallel callbacks and the Mutex
-    executor = MultiThreadedExecutor(num_threads=4)
-    executor.add_node(node)
-
     try:
-        executor.spin()
+        rclpy.spin(node)
     except KeyboardInterrupt:
         pass
     finally:
-        node.stop_robot()
         node.destroy_node()
         rclpy.shutdown()
 
