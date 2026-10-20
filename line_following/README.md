@@ -3,9 +3,27 @@
 Reference code for a line-following robot built on the **Thymio II**, using **ROS 2** and **Aseba**.
 The project is meant for learning how to work with the Thymio and ROS 2.
 
-The node reads the two ground sensors (`/ground/left` and `/ground/right`), decides how to move, and
-publishes the velocity to `/cmd_vel`. The **sensor detection threshold (`ground.threshold`) can be changed
-in real time**, without stopping the robot and without editing the code.
+The node reads the **raw values of the two ground sensors**, turns them into a "how much line do I see"
+level, and steers the robot with **proportional (P) control**. All the tuning values are ROS parameters,
+so they can be **changed in real time**, without stopping the robot and without editing the code.
+
+## How it works
+
+1. The driver publishes the raw reflection of each ground sensor (0 to 1023) on `/aseba/events/ground_reflected`.
+2. Each raw value is converted to a level between **0.0** (floor) and **1.0** (line), using the
+   calibration parameters `line_value` and `floor_value`.
+3. The error is the difference between the two sensors: `error = left level - right level`.
+4. The robot turns proportionally to the error: `angular.z = kp * error`. The bigger the error,
+   the stronger the turn, and the slower the robot goes.
+5. If no sensor sees the line, the robot goes straight for a short time and then rotates towards the
+   side where the line was last seen.
+
+| Left level | Right level | Error | Result (with `kp` = 0.8) |
+|---|---|---|---|
+| 1.0 | 0.0 | +1.0 | Turns left at 0.8 rad/s |
+| 1.0 | 1.0 | 0.0 | Goes straight |
+| 0.0 | 1.0 | -1.0 | Turns right at 0.8 rad/s |
+| 0.7 | 0.2 | +0.5 | Turns left at 0.4 rad/s (gentler correction) |
 
 ## Structure
 
@@ -26,7 +44,11 @@ line_following/
 ## Requirements
 
 - Ubuntu 24.04 with **ROS 2 Jazzy**
-- The [`ros-thymio`](#mandatory-change-in-thymio_driver) package (`thymio_driver` and `asebaros`) built in the same workspace
+- The `ros-thymio` package (`thymio_driver` and `asebaros`) built in the same workspace
+- The `asebaros_msgs` package (comes with `ros-thymio`), declared in the `package.xml` of `line_follower`:
+  ```xml
+  <exec_depend>asebaros_msgs</exec_depend>
+  ```
 - Thymio II turned on and connected over USB (shows up as `/dev/ttyACM0`)
 
 ## Get the project
@@ -71,148 +93,128 @@ ros2 run line_follower line_follower
 
 To stop, always use `Ctrl+C` and wait for the processes to finish.
 
-## The `ground_threshold` parameter
+## Parameters
 
-The node has the `ground_threshold` parameter, which forwards its value to the `ground.threshold` parameter of `thymio_driver`.
+| Parameter | Default | Range | What it does |
+|---|---|---|---|
+| `kp` | 0.8 | 0 to 5 | Proportional gain: rad/s of turn per unit of error |
+| `forward_speed` | 0.10 | 0 to 0.5 | Linear speed (m/s) with the line centered |
+| `turn_linear_speed` | 0.06 | 0 to 0.5 | Linear speed (m/s) when the error is maximum |
+| `line_value` | 250.0 | 0 to 1023 | Raw sensor reading over the line |
+| `floor_value` | 950.0 | 0 to 1023 | Raw sensor reading over the floor |
+| `lost_level` | 0.3 | 0 to 1 | Level below which the line is considered lost |
 
-```bash
-# See the current value
-ros2 param get /line_follower ground_threshold
+The defaults assume a **black line over a white floor**. How they are used:
 
-# Change it while the robot is running (use a decimal point)
-ros2 param set /line_follower ground_threshold 320.0
+- `line_value` and `floor_value` are the two reference points of the calibration: the raw value over the
+  line becomes level 1.0, the raw value over the floor becomes level 0.0, and everything in between is proportional.
+- `lost_level`: if neither sensor reaches this level, the robot stops following the line and starts the search.
+- The speed goes from `forward_speed` (error 0) down to `turn_linear_speed` (error 1) as the error grows.
 
-# Check what the driver received
-ros2 param get /thymio_driver ground.threshold
-```
-
-How it works:
-
-- On startup, the node reads the `ground.threshold` the driver is currently using and starts with that value. Starting the node never changes the driver by itself.
-- If the driver is not running at startup, a warning is shown and the initial value is `200.0`.
-- Accepted range: `0.0` to `1023.0` (scale of the raw values of the Thymio ground sensors).
-- Sending the value to the driver does not block the node. The result shows up in the terminal (`Driver ground.threshold updated.` or a refusal warning).
-- The value is **not saved**: when the driver restarts, the threshold goes back to the default (`200`).
-
-You can also change it directly on the driver, without the line follower node running:
+## Viewing the parameters
 
 ```bash
-ros2 param set /thymio_driver ground.threshold 320
+# List the node parameters
+ros2 param list /line_follower
+
+# Current value of a parameter
+ros2 param get /line_follower kp
+
+# Description and allowed range
+ros2 param describe /line_follower kp
+
+# All values at once
+ros2 param dump /line_follower
 ```
 
-## Mandatory change in `thymio_driver`
+## Changing the parameters (while the robot is running)
 
-> **Warning:** the original `thymio_driver` reads `ground.threshold` **only once**, at startup, and
-> stores the value in an internal variable. After that, the sensor calculation only uses that copy.
-> Result: `ros2 param set` answers `Set parameter successful` and `ros2 param get` shows the new
-> value, but **the sensor readings do not change**.
->
-> Without the change below, the `ground_threshold` of this project **has no real-time effect**.
-
-The change goes in the `ros-thymio` package, which is **not part of this repository**. Everyone who uses the
-project needs to apply it.
-
-**1. Edit the file**
-
-`~/thymio_ws/src/ros-thymio/thymio_driver/thymio_driver/thymio_driver_node.py`
-
-Find the line:
-
-```python
-ir_threshold = self.ground_threshold
-```
-
-and replace it with:
-
-```python
-ir_threshold = self.get_parameter("ground.threshold").value
-```
-
-Or from the terminal (makes a backup first):
+Always use a decimal point (`0.6`, not `1`):
 
 ```bash
-F=~/thymio_ws/src/ros-thymio/thymio_driver/thymio_driver/thymio_driver_node.py
-cp $F /tmp/thymio_driver_node.py.bak
-sed -i 's/ir_threshold = self.ground_threshold/ir_threshold = self.get_parameter("ground.threshold").value/' $F
-grep -n "ir_threshold" $F
+ros2 param set /line_follower kp 0.6
+ros2 param set /line_follower forward_speed 0.08
+ros2 param set /line_follower turn_linear_speed 0.05
+ros2 param set /line_follower line_value 250.0
+ros2 param set /line_follower floor_value 950.0
+ros2 param set /line_follower lost_level 0.25
 ```
 
-**2. Rebuild the driver (without `--symlink-install`)**
+If a value is outside the allowed range, or if `line_value` becomes equal to `floor_value`, the node
+rejects the change and shows the reason in its terminal.
+
+Tuning `kp`: if the robot zigzags, lower it; if it is slow to return to the line, raise it.
+
+## Viewing the floor colors (raw values)
+
+Each number is the infrared reflection read by a sensor, from 0 to 1023. **A lower value means a darker surface.**
+The message carries two numbers: the first is the left sensor and the second is the right sensor.
 
 ```bash
-pkill -f asebaros          # only if an old asebaros is still running
-cd ~/thymio_ws
-rm -rf build/thymio_driver install/thymio_driver
-colcon build --packages-select thymio_driver
-source install/setup.bash
+# Continuous reading of both sensors
+ros2 topic echo /aseba/events/ground_reflected --field data
+
+# A single reading
+ros2 topic echo /aseba/events/ground_reflected --field data --once
+
+# Full message (with stamp and source)
+ros2 topic echo /aseba/events/ground_reflected --once
 ```
 
-> Do not use `--symlink-install` on `thymio_driver`: the driver stops starting, with the error
-> `PackageNotFoundError: No package metadata was found for thymio-driver`.
+**How to calibrate:**
 
-**3. Restart the driver launch** and test:
+1. Put both sensors over the **line** and write down the values.
+2. Repeat over the **floor**.
+3. Apply them:
+   ```bash
+   ros2 param set /line_follower line_value <value_over_the_line>
+   ros2 param set /line_follower floor_value <value_over_the_floor>
+   ```
 
-```bash
-# With one sensor held over any surface
-ros2 param set /thymio_driver ground.threshold 1000
-timeout 3 ros2 topic echo /ground/right --field range --once    # expected: 1.0
+Measure both sensors, because each one reads slightly differently. The bigger the difference between
+`line_value` and `floor_value`, the less noisy the control is.
 
-ros2 param set /thymio_driver ground.threshold 5
-timeout 3 ros2 topic echo /ground/right --field range --once    # expected: 0.0
-```
-
-If both results are the same, the driver still has the original code.
-
-After any new edit to the driver code, you need to rebuild `thymio_driver` and restart the launch.
-
-## How to choose the threshold (calibration)
-
-The driver publishes **1.0 when the measured reflection is lower than the threshold** and **0.0 when it is higher**.
-The threshold must sit between the line value and the background value:
-
-```
-dark line  <  THRESHOLD  <  lighter background
-```
-
-**1. Measure the raw values** on each surface (`data[0]` = left sensor, `data[1]` = right sensor):
-
-```bash
-ros2 topic echo /aseba/events/ground_reflected
-```
-
-**2. Compute the average** between the highest line value and the lowest background value, considering both
-sensors (the driver uses a single threshold for both).
-
-**3. Apply it and check** with both sensors, one at a time:
-
-```bash
-ros2 param set /line_follower ground_threshold 320.0
-ros2 topic echo /ground/left --field range
-ros2 topic echo /ground/right --field range
-```
-
-Expected: **1.0 over the line** and **0.0 over the background**, on both sensors.
+**Following a white line:** just swap what the two values mean. Set `line_value` to the reading over
+the white line and `floor_value` to the reading over the floor (for example, `line_value` 957 and
+`floor_value` 265 for a white line over a black floor). The formula works in both directions.
 
 Example of raw values measured in our setup (your track may give different numbers):
 
 | Surface | Approximate raw value |
 |---|---|
 | Air (robot lifted) | 26 |
-| Black | 258–273 |
-| Brown | 367–390 |
+| Black | 258-273 |
+| Brown | 367-390 |
 | White | 957 |
 
-The bigger the difference between the line and the background, the more robust the detection. Matte black
-electrical tape on white paper gives much more margin than black on brown.
+## Code overview
+
+| Part | What it does |
+|---|---|
+| `PARAM_INFO` | Table with the default value, description and limits of every parameter. A loop declares them all in ROS |
+| `GroundSensor` | Stores the last raw value of one sensor and tells whether it has received data |
+| `SensorDatabase` | Registers the sensors in one place. Offers `all_ready()` and `snapshot()` (current values of all sensors) |
+| `ground_callback` | Receives each message from the driver and updates the sensors in the database |
+| `calculate_darkness` | Converts a raw value to a level from 0.0 (floor) to 1.0 (line) |
+| `control_loop` | Runs 10 times per second: reads the sensors, computes the error and chooses between following and searching |
+| `follow_line` | P control: `angular.z = kp * error`, and reduces the speed as the error grows |
+| `search_line` | Line lost: goes straight for 0.5 s, then rotates towards the side where the line was last seen |
+| `parameters_callback` | Runs before a parameter changes and rejects invalid combinations |
+
+About the locks (`threading.Lock`): they protect the sensor dictionary and the navigation state
+(`last_direction` and `line_lost_time`). The node uses the default single-threaded executor (`rclpy.spin`),
+so callbacks never run at the same time; the locks become necessary if you switch to a `MultiThreadedExecutor`.
 
 ## Common problems
 
 | Symptom | Likely cause | What to do |
 |---|---|---|
 | `Cannot bind socket to port` on launch | An old `asebaros` is still running | Close the old launch with `Ctrl+C` or use `pkill -f asebaros` and try again |
-| `thymio_driver` dies with `PackageNotFoundError` | Driver built with `--symlink-install` | Rebuild without that option (see the driver section) |
-| `ros2 param set` works but the reading does not change | Driver without the mandatory change | Apply the change to `thymio_driver` |
+| `thymio_driver` dies with `PackageNotFoundError` | Driver built with `--symlink-install` | Rebuild it without that option: `colcon build --packages-select thymio_driver` |
 | `unknown package 'line_follower'` on `colcon build` | Command run outside the workspace root | Run it from the root: `cd ~/thymio_ws` |
 | `topic echo` hangs and shows nothing | The driver is not publishing (no `asebaros` or no connection to the robot) | Restart the launch and check `ls /dev/ttyACM*`; use `timeout 3` in the commands |
-| Robot reads 0.0 on any surface | Threshold below the line value | Raise `ground_threshold` (see calibration) |
-| Robot keeps spinning or stays still | The sensors do not see the line (wrong threshold or low contrast) | Check the readings and adjust the threshold |
+| Robot does not move at startup | It waits for the first sensor message | Check that `/aseba/events/ground_reflected` is publishing |
+| Robot turns the wrong way | The sensor order is swapped (the node assumes `data[0]` is the left sensor) | Cover only the left sensor with the line and check which value drops; swap the two indexes in `ground_callback` if needed |
+| Robot zigzags | `kp` too high | Lower `kp` |
+| Robot is slow to return to the line | `kp` too low | Raise `kp` |
+| Robot keeps spinning or stays still | The sensors do not see the line (wrong calibration or low contrast) | Check the raw values and set `line_value` and `floor_value` again |
