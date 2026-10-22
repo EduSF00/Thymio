@@ -1,270 +1,250 @@
-import threading                       
-from typing import Dict, Tuple, Optional   #Type hints 
+import math
 import rclpy
 from rclpy.node import Node
-
-# FloatingPointRange / ParameterDescriptor: describe a parameter and its limits
-# SetParametersResult: the answer ("accepted" or "rejected") of the parameter callback
-from rcl_interfaces.msg import FloatingPointRange, ParameterDescriptor, SetParametersResult
-from asebaros_msgs.msg import Event    # Aseba event message that carries the raw sensor values
-from geometry_msgs.msg import Twist    # Velocity command (linear and angular speed)
+from sensor_msgs.msg import Range
+from geometry_msgs.msg import Twist
 
 
-# Parameters that can be changed while the robot is running
-# name: (default value, description, lowest value, highest value)
-# Refuses any value outside the limits
-PARAM_INFO = {
-    'kp':                (0.8,   'Proportional gain (rad/s of turn per unit of error)', 0.0, 5.0),
-    'forward_speed':     (0.10,  'Linear speed with the line centered (m/s)', 0.0, 0.5),
-    'turn_linear_speed': (0.06,  'Linear speed when the error is maximum (m/s)', 0.0, 0.5),
-    'line_value':        (250.0, 'Raw sensor reading over the line', 0.0, 1023.0),
-    'floor_value':       (950.0, 'Raw sensor reading over the floor', 0.0, 1023.0),
-    'lost_level':        (0.3,   'Darkness (0 to 1) below which the line is considered lost', 0.0, 1.0),
-}
-
-
-class GroundSensor:
-    """Represents an individual ground sensor with its raw value and readiness state"""
-    def __init__(self, name: str):
-        self.name = name                            # 'left' or 'right'
-        self.raw_value: Optional[float] = None      # None = no message received yet
-
-    def update(self, value: float):
-        # Stores the newest raw reading
-        self.raw_value = value
-
-    def read(self) -> Tuple[Optional[float], bool]:
-        """Returns (current_value, has_received_data)"""
-        return self.raw_value, self.raw_value is not None
-
-
-class SensorDatabase:
-    """Place where all sensors are registered"""
-    def __init__(self):
-        self._sensors: Dict[str, GroundSensor] = {}   # name -> sensor object
-        # Mutex of the database: only one piece of code at a time can use the dictionary.
-        # NOTE: it covers the dictionary access (add/get/all_ready/snapshot). The call to
-        # sensor.update() in ground_callback happens after get() returns, outside this lock.
-        self.lock = threading.Lock()
-
-    def add(self, sensor: GroundSensor) -> GroundSensor:
-        # Registers a sensor in the database
-        with self.lock:                       # 'with' locks on entering and unlocks on leaving
-            self._sensors[sensor.name] = sensor
-        return sensor
-
-    def get(self, name: str) -> GroundSensor:
-        # Finds a sensor by its name ('left' or 'right')
-        with self.lock:
-            return self._sensors[name]
-
-    def all_ready(self) -> bool:
-        """True when ALL sensors have already sent at least one value."""
-        with self.lock:
-            if not self._sensors:
-                return False
-            return all(sensor.read()[1] for sensor in self._sensors.values())
-
-    def snapshot(self) -> Dict[str, float]:
-        """Snapshot of current values: {'left': 250.0, 'right': 950.0}"""
-        # Only sensors that already received data are included
-        with self.lock:
-            return {name: sensor.read()[0] for name, sensor in self._sensors.items() if sensor.read()[1]}
-
-
-class LineFollower(Node):
+class ThymioController(Node):
 
     def __init__(self):
-        super().__init__('line_follower')
+        super().__init__('thymio_controller')
+        
+        # ROS Parameters configuration for speeds, distances, timeout, and PD gains
+        self.declare_parameter('linear_speed', 0.10)
+        self.declare_parameter('wall_lost_dist', 0.12)
+        self.declare_parameter('front_stop_dist', 0.06)
+        self.declare_parameter('sensor_timeout', 0.5)
+        self.declare_parameter('target_wall_dist', 0.07)
+        self.declare_parameter('max_angular_speed', 0.8)
+        self.declare_parameter('front_release_dist', 0.08)
+        self.declare_parameter('kp', 8.0)
+        self.declare_parameter('kd', 0.25)
 
-        # Initialize the Sensor Database and register the left and right sensors
-        # the control loop asks the database for the values instead of storing them itself
-        self.sensor_db = SensorDatabase()
-        self.sensor_db.add(GroundSensor('left'))
-        self.sensor_db.add(GroundSensor('right'))
-
-        # Mutex to protect the robot's navigation state (last_direction and line_lost_time)
-        self.lock = threading.Lock()
-
-        # Declares the parameters with description and limits
-        # One loop declares all of them, using the PARAM_INFO table
-        for name, (default, description, low, high) in PARAM_INFO.items():
-            self.declare_parameter(
-                name,
-                default,
-                ParameterDescriptor(
-                    description=description,
-                    floating_point_range=[FloatingPointRange(from_value=low, to_value=high, step=0.0)]
-                )
-            )
-
-        # Called every time someone runs: ros2 param set /line_follower <name> <value>
-        self.add_on_set_parameters_callback(self.parameters_callback)
-
-        # Publishes to the robot velocity topic
+        # Publisher for velocity commands and subscribers for proximity sensors
         self.cmd_vel_pub = self.create_publisher(Twist, '/cmd_vel', 10)
 
-        # Subscription to the raw ground sensors
-        # The message has a list called "data": data[0] = left sensor, data[1] = right sensor
-        self.ground_sub = self.create_subscription(
-            Event, '/aseba/events/ground_reflected', self.ground_callback, 10
-        )
+        self.create_subscription(Range, '/proximity/right', self.right_sensor_callback, 10)
+        self.create_subscription(Range, '/proximity/center', self.center_sensor_callback, 10)
 
-        # Stores the last direction in function of line detection
-        # 1 = line was last seen on the left | -1 = on the right | 0 = unknown
-        self.last_direction = 0
+        # Possible States:
+        # FOLLOW_WALL
+        # TURN_LEFT
+        # SEARCH_WALL
 
-        # Errors smaller than this are ignored when remembering the last direction
-        self.direction_deadband = 0.1
+        # Initial State
+        self.state = 'FOLLOW_WALL'
 
-        # Moment when the line was lost (None while the line is visible)
-        self.line_lost_time = None
-
-        # Time going straight after losing the line, before starting to search (s)
-        self.search_delay = 0.5
-
-        # Rotation speed while searching for the line (rad/s)
-        self.search_speed = 0.8
-
-        # Timer running the control loop 10 times per second (10 Hz)
+        # Control loop timer running at 10Hz (0.1s)
         self.timer = self.create_timer(0.1, self.control_loop)
 
-    def param(self, name):
-        """Returns the current value of a parameter (always up to date)"""
-        # Reading the parameter every time is what makes changes take effect immediately
-        return self.get_parameter(name).value
+        # Internal sensor variables and timestamps for freshness check
+        self.center_dist = None # Distance received from the center sensor
+        self.right_dist = None  # Distance received from the right sensor
+        self.center_stamp = None
+        self.right_stamp = None
 
-    def parameters_callback(self, changes):
-        """Called by ROS BEFORE a parameter changes. Returning False rejects the change"""
-        # Uses the new value if it is being changed now, otherwise the current one
-        values = {c.name: c.value for c in changes}
-        line = values.get('line_value', self.param('line_value'))
-        floor = values.get('floor_value', self.param('floor_value'))
+        # PD controller variables
+        self.previous_error = 0.0
+        self.derivative_filtered = 0.0
 
-        # Equal values would make the normalization divide by zero
-        if line == floor:
-            reason = 'line_value and floor_value cannot be equal'
-            self.get_logger().warn(f'Parameter rejected: {reason}')
-            return SetParametersResult(successful=False, reason=reason)
+        # SEARCH_WALL parameters: move forward 15 cm then turn 90 degrees to the right
+        self.search_phase = 'ADVANCE'   # ADVANCE -> TURN
+        self.search_phase_start = None
+        self.search_finished = False    # True when the complete search maneuver has finished
 
-        return SetParametersResult(successful=True)
+        self.search_advance_dist = 0.15              # m
+        self.search_advance_speed = 0.10             # m/s
+        self.search_advance_duration = (
+            self.search_advance_dist / self.search_advance_speed)  # 1.5 s
 
-    def ground_callback(self, msg):
-        """Updates the sensor database with the received values"""
-        # Runs every time a new reading arrives (about 10 times per second)
-        if len(msg.data) >= 2:
-            self.sensor_db.get('left').update(float(msg.data[0]))
-            self.sensor_db.get('right').update(float(msg.data[1]))
+        self.search_turn_angle = math.pi / 2         # rad (90 degrees)
+        self.search_turn_speed = -0.8                # rad/s (negative = right turn)
+        self.search_turn_duration = (
+            self.search_turn_angle / abs(self.search_turn_speed))  # ~1.96 s
 
-    def calculate_darkness(self, raw, line, floor):
-        """Converts a raw reading to 0.0 (floor) and 1.0 (line)"""
-        # Extra protection against dividing by zero
-        if line == floor:
-            return 0.0
-        # Linear scale: raw == floor gives 0.0, raw == line gives 1.0
-        # It also works when the line is lighter than the floor (line > floor)
-        value = (floor - raw) / (floor - line)
-        # Keeps the result between 0.0 and 1.0 (readings outside the range are clipped)
-        return max(0.0, min(1.0, value))
+        self.last_control_time = self.get_clock().now()
+
+
+    def _read_range(self, msg: Range):
+        """Convert missing or invalid range readings into None."""
+        value = msg.range
+        if not math.isfinite(value) or value <= 0.0:
+            return None
+        return value        
+
+    def center_sensor_callback(self, msg: Range):
+        """Store center sensor reading and the timestamp when it occurred."""
+        self.center_dist = self._read_range(msg)
+        self.center_stamp = self.get_clock().now()
+
+    def right_sensor_callback(self, msg: Range):
+        """Store right sensor reading and the timestamp when it occurred."""
+        self.right_dist = self._read_range(msg)
+        self.right_stamp = self.get_clock().now()
+
+    def reset_search(self):
+        """Reset the SEARCH_WALL maneuver (move 15 cm + turn 90 degrees)."""
+        self.search_phase = 'ADVANCE'
+        self.search_phase_start = None
+        self.search_finished = False
+
+    def change_state(self, new_state):
+        """Handle state transitions and log changes."""
+        if new_state != self.state:
+            self.state = new_state
+            if new_state == 'SEARCH_WALL':
+                self.reset_search()
+            self.get_logger().info(f'State: {self.state}')
+
+    def _sensor_is_fresh(self, stamp, timeout):
+        """Verify if the last sensor reading is within the acceptable timeout limit."""
+        if stamp is None:
+            return False
+        age = (self.get_clock().now() - stamp).nanoseconds / 1e9
+        return age <= timeout
+
+
+    @staticmethod
+    def clamp(value, low, high):
+        """Clamp a value between a lower and upper bound."""
+        return max(low, min(high, value))
 
     def control_loop(self):
-        # Runs 10 times per second: reads the sensors, decides and publishes the command
+        """Main control loop handling FSM transitions and velocity calculations."""
+        now = self.get_clock().now()
+        dt = (now - self.last_control_time).nanoseconds / 1e9
+        self.last_control_time = now
+        if dt <= 0.0:
+            dt = 0.1
 
-        # Checks if all sensors have sent data using the SensorDatabase
-        # (until the first message arrives, the robot stays stopped)
-        if not self.sensor_db.all_ready():
-            self.cmd_vel_pub.publish(Twist())     # Empty Twist = zero speed
-            return
+        timeout = float(self.get_parameter('sensor_timeout').value)
 
-        # Gets the updated sensor snapshot cleanly
-        snap = self.sensor_db.snapshot()
-        left_val = snap.get('left')
-        right_val = snap.get('right')
+        center_fresh = self._sensor_is_fresh(self.center_stamp, timeout)
+        right_fresh = self._sensor_is_fresh(self.right_stamp, timeout)
 
-        # Extra safety: stays stopped if any value is still missing
-        if left_val is None or right_val is None:
-            self.cmd_vel_pub.publish(Twist())
-            return
+        front = self.center_dist if center_fresh else None
+        right = self.right_dist if right_fresh else None
+        
+        front_stop = float(self.get_parameter('front_stop_dist').value)
+        front_release = float(self.get_parameter('front_release_dist').value)
+        wall_lost = float(self.get_parameter('wall_lost_dist').value)
+        target_great = float(self.get_parameter('target_wall_dist').value)
+        
+        front_blocked = front is not None and front <= front_stop
+        front_clear = front is None or front >= front_release
+        wall_detected = right is not None and right < wall_lost
 
-        # Reads the calibration parameters (they can change while the robot runs)
-        line_val = self.param('line_value')
-        floor_val = self.param('floor_value')
-
-        # Converts each raw reading to 0.0 (floor) and 1.0 (line)
-        left_dark = self.calculate_darkness(left_val, line_val, floor_val)
-        right_dark = self.calculate_darkness(right_val, line_val, floor_val)
-
-        # Error: positive = line on the left | negative = line on the right | 0 = centered
-        error = left_dark - right_dark
-
-        # At least one sensor sees the line -> proportional control
-        if max(left_dark, right_dark) >= self.param('lost_level'):
-            cmd = self.follow_line(error)
-        # No sensor sees the line -> search
+        # FINITE STATE MACHINE (FSM) LOGIC
+        # Priority 1: Prevent frontal collisions by turning left if blocked.
+        if self.state == 'TURN_LEFT':
+            # Keep turning until the front is clear and right wall status is evaluated
+            if front_clear:
+                self.change_state(
+                    'FOLLOW_WALL' if wall_detected else 'SEARCH_WALL')
+        elif front_blocked:
+            self.change_state('TURN_LEFT')
+        elif self.state == 'SEARCH_WALL' and not self.search_finished:
+            # Do not interrupt the search maneuver (move 15 cm + turn 90) halfway through.
+            pass
+        elif not wall_detected:
+            if self.state == 'SEARCH_WALL':
+                # Maneuver completed and wall still not found: repeat search.
+                self.reset_search()
+            self.change_state('SEARCH_WALL')
         else:
-            cmd = self.search_line()
+            self.change_state('FOLLOW_WALL')
 
-        # Publishes the command
+        cmd = Twist()
+        max_speed = float(self.get_parameter('linear_speed').value)
+        max_angular = abs(float(
+            self.get_parameter('max_angular_speed').value))
+
+        # BEHAVIOR EXECUTION PER STATE
+        if self.state == 'TURN_LEFT':
+            # Rotate in place until the front obstacle is cleared.
+            cmd.linear.x = 0.0
+            cmd.angular.z = min(1.0, max_angular)
+                                
+        elif self.state == 'SEARCH_WALL':
+            # Phase 1: Move forward 15 cm. Phase 2: Turn 90 degrees to the right.
+            if self.search_phase_start is None:
+                self.search_phase_start = now
+            elapsed = (now - self.search_phase_start).nanoseconds / 1e9
+
+            if self.search_phase == 'ADVANCE':
+                cmd.linear.x = self.search_advance_speed
+                cmd.angular.z = 0.0
+                if elapsed >= self.search_advance_duration:
+                    self.search_phase = 'TURN'
+                    self.search_phase_start = now
+
+            elif self.search_phase == 'TURN':
+                cmd.linear.x = 0.0
+                cmd.angular.z = self.search_turn_speed
+                if elapsed >= self.search_turn_duration:
+                    # Maneuver finished: let the FSM re-evaluate conditions.
+                    self.search_finished = True
+                    cmd.angular.z = 0.0
+
+       
+        elif self.state == 'FOLLOW_WALL':
+            # Safety check: ensure right sensor data is available before running PD controller
+            if right is None:
+                cmd.linear.x = 0.0
+                cmd.angular.z = 0.0
+                self.cmd_vel_pub.publish(cmd)
+                return
+
+            target = float(self.get_parameter('target_wall_dist').value)
+            kp = float(self.get_parameter('kp').value)
+            kd = float(self.get_parameter('kd').value)
+
+            # Positive error = wall is too far; needs to steer to the right.
+            error = right - target
+            derivative = (error - self.previous_error) / dt
+            
+            # Simple low-pass filter to reduce sensor noise and oscillations.
+            alpha = 0.25
+            self.derivative_filtered = (
+                alpha * derivative +
+                (1.0 - alpha) * self.derivative_filtered
+            )
+            self.previous_error = error
+
+            # ROS convention: positive angular velocity turns left, negative turns right.
+            angular = -(kp * error + kd * self.derivative_filtered)
+            cmd.angular.z = self.clamp(angular, -max_angular, max_angular)
+
+            # Reduce linear speed based on proximity to front obstacles.
+            if front is None:
+                front_factor = 1.0
+            else:
+                slow_dist = max(front_release, front_stop + 0.01)
+                front_factor = self.clamp(
+                    (front - front_stop) / (slow_dist - front_stop), 0.0, 1.0)
+
+            # Sharper turns also reduce linear speed for stability.
+            turn_factor = 1.0 - 0.5 * min(1.0, abs(cmd.angular.z) / max(max_angular, 1e-6))
+            cmd.linear.x = max_speed * min(front_factor, turn_factor)
+            
+        else:
+            # Unexpected state: stop safely.
+            cmd.linear.x = 0.0
+            cmd.angular.z = 0.0
+
         self.cmd_vel_pub.publish(cmd)
-
-    def follow_line(self, error):
-        """Proportional (P) control: the bigger the error, the stronger the turn"""
-        cmd = Twist()
-
-        # Protected by the mutex because last_direction and line_lost_time are shared state
-        with self.lock:
-            # The line is visible, so the "line lost" timer is reset
-            self.line_lost_time = None
-            # Remembers on which side the line is (ignores very small errors)
-            if abs(error) > self.direction_deadband:
-                self.last_direction = 1 if error > 0 else -1
-
-        forward = self.param('forward_speed')
-        turn = self.param('turn_linear_speed')
-
-        # P control: turn speed proportional to the error
-        # (error +1 with kp 0.8 turns left at 0.8 rad/s; error 0 goes straight)
-        cmd.angular.z = self.param('kp') * error
-        # The bigger the error, the slower the robot (forward_speed -> turn_linear_speed)
-        cmd.linear.x = forward - (forward - turn) * abs(error)
-
-        return cmd
-
-    def search_line(self):
-        """No sensor over the line: keeps moving forward for a while, then searches"""
-        cmd = Twist()
-
-        with self.lock:
-            # First moment when the line is lost: starts the timer
-            if self.line_lost_time is None:
-                self.line_lost_time = self.get_clock().now()
-
-            # How long the line has been lost (s)
-            elapsed_time = (self.get_clock().now() - self.line_lost_time).nanoseconds / 1e9
-            # Copies the direction to use it after leaving the lock
-            direction = self.last_direction
-
-        # Not enough time has passed: continue moving forward
-        if elapsed_time < self.search_delay:
-            cmd.linear.x = self.param('forward_speed')
-        # Enough time has passed: rotate towards the side where the line was last seen
-        # (direction is 0 if unknown, so the robot stays stopped)
-        else:
-            cmd.angular.z = self.search_speed * direction
-
-        return cmd
-
 
 def main(args=None):
     rclpy.init(args=args)
-
-    node = LineFollower()
-
+    node = ThymioController()
     try:
-        rclpy.spin(node)        # Keeps the node running until Ctrl+C
+        rclpy.spin(node)
     except KeyboardInterrupt:
         pass
     finally:
+        # Attempt to stop the robot safely upon node shutdown.
+        node.cmd_vel_pub.publish(Twist())
         node.destroy_node()
         rclpy.shutdown()
 
